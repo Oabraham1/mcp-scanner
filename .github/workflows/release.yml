@@ -53,7 +53,7 @@ jobs:
           7z a ../../../mcp-guard-${{ matrix.target }}.zip ${{ matrix.artifact }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: mcp-guard-${{ matrix.target }}
           path: mcp-guard-${{ matrix.target }}.*
