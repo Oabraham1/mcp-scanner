@@ -1,4 +1,9 @@
 //! Detects overly broad permission scopes in tools.
+//!
+//! This detector focuses on REAL threats with minimal false positives:
+//! - Actual code execution (shell, eval, exec in descriptions)
+//! - Credential exposure (tools that return/handle secrets)
+//! - Root filesystem access (server configured with / or ~)
 
 use crate::discovery::ServerConfig;
 use crate::scanner::report::{ResourceInfo, Severity, Threat, ThreatCategory, ToolInfo};
@@ -6,148 +11,136 @@ use crate::scanner::threats::ThreatDetector;
 use regex::Regex;
 use std::sync::LazyLock;
 
-static DANGEROUS_PATTERNS: LazyLock<Vec<DangerPattern>> = LazyLock::new(|| {
-    vec![
-        // Code execution
-        DangerPattern::new(
-            r"(?i)\b(exec|eval|execute|run|shell|command|spawn|system)\b",
-            "Potential code execution capability",
-            Severity::High,
-            "Code execution tools can run arbitrary commands. Ensure proper input validation and sandboxing.",
-        ),
-        // Filesystem - broad access
-        DangerPattern::new(
-            r#"(?i)"path"\s*:\s*\{\s*"type"\s*:\s*"string""#,
-            "Accepts arbitrary file paths",
-            Severity::Medium,
-            "Tools that accept arbitrary paths should validate against allowed directories.",
-        ),
-        // Network
-        DangerPattern::new(
-            r"(?i)\b(url|uri|endpoint|host|hostname|fetch|request|http|https)\b",
-            "Network access capability",
-            Severity::Medium,
-            "Network-accessing tools can exfiltrate data. Consider restricting allowed domains.",
-        ),
-        // Database
-        DangerPattern::new(
-            r"(?i)\b(query|sql|database|db|select|insert|update|delete)\b",
-            "Database access capability",
-            Severity::Medium,
-            "Database tools should use parameterized queries and limited permissions.",
-        ),
-        // Credentials
-        DangerPattern::new(
-            r"(?i)\b(password|secret|token|key|credential|auth|api.?key)\b",
-            "Handles sensitive credentials",
-            Severity::High,
-            "Tools handling credentials should use secure storage and avoid logging values.",
-        ),
-    ]
+/// Patterns that indicate ACTUAL code execution capability.
+/// Must match in the tool DESCRIPTION, not just the name.
+static CODE_EXEC_PATTERNS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(executes?|runs?|spawns?)\s+(a\s+)?(shell|command|script|code|program|process)\b",
+    )
+    .unwrap()
 });
 
-struct DangerPattern {
-    regex: Regex,
-    title: &'static str,
-    severity: Severity,
-    remediation: &'static str,
-}
+/// Patterns that indicate the tool handles credentials.
+/// Must match in description showing the tool RETURNS or EXPOSES secrets.
+static CREDENTIAL_PATTERNS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(returns?|gets?|retrieves?|exposes?|outputs?)\s+.{0,20}(password|secret|token|api.?key|credential|private.?key)\b").unwrap()
+});
 
-impl DangerPattern {
-    fn new(
-        pattern: &str,
-        title: &'static str,
-        severity: Severity,
-        remediation: &'static str,
-    ) -> Self {
-        Self {
-            regex: Regex::new(pattern).expect("Invalid regex"),
-            title,
-            severity,
-            remediation,
-        }
-    }
-}
+/// Patterns that indicate raw SQL execution (not just database access).
+static RAW_SQL_PATTERNS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(executes?|runs?)\s+(raw\s+|arbitrary\s+)?(sql|query|queries)\b").unwrap()
+});
 
-pub struct PermissionScopeDetector {
-    root_path_patterns: Vec<Regex>,
-}
+pub struct PermissionScopeDetector;
 
 impl PermissionScopeDetector {
     pub fn new() -> Self {
-        Self {
-            root_path_patterns: vec![
-                Regex::new(r#"["']/["']"#).unwrap(),        // "/" alone
-                Regex::new(r#"["']~["']"#).unwrap(),        // "~" home dir
-                Regex::new(r#"["'][A-Z]:\\["']"#).unwrap(), // Windows root like "C:\"
-                Regex::new(r#"["']/home["']"#).unwrap(),    // /home
-                Regex::new(r#"["']/Users["']"#).unwrap(),   // macOS /Users
-                Regex::new(r#"["']/etc["']"#).unwrap(),     // system config
-                Regex::new(r#"["']/var["']"#).unwrap(),     // system data
-            ],
+        Self
+    }
+
+    fn check_server_args(&self, server: &ServerConfig) -> Vec<Threat> {
+        let mut threats = Vec::new();
+
+        // Check if server has root filesystem access
+        let args_str = server.args.join(" ");
+        let has_root_access = args_str.contains(" / ")
+            || args_str.ends_with(" /")
+            || args_str.contains(" /\"")
+            || args_str.contains(" /'")
+            || server
+                .args
+                .iter()
+                .any(|a| a == "/" || a == "~" || a == "/home" || a == "/Users");
+
+        if has_root_access {
+            threats.push(
+                Threat::new(
+                    "PERM-ROOT",
+                    Severity::High,
+                    ThreatCategory::PermissionScope,
+                    "Server has root filesystem access",
+                )
+                .with_message(format!(
+                    "Server '{}' is configured with access to root or home directories",
+                    server.name
+                ))
+                .with_evidence(format!("Args: {}", args_str))
+                .with_remediation(
+                    "Restrict filesystem access to specific directories needed for the task",
+                ),
+            );
         }
+
+        threats
     }
 
     fn check_tool(&self, tool: &ToolInfo) -> Vec<Threat> {
         let mut threats = Vec::new();
+        let description = tool.description.as_deref().unwrap_or("");
 
-        let combined_text = format!(
-            "{} {} {}",
-            tool.name,
-            tool.description.as_deref().unwrap_or(""),
-            serde_json::to_string(&tool.input_schema).unwrap_or_default()
-        );
+        // Only check DESCRIPTIONS for dangerous capabilities, not names
 
-        // Check for dangerous patterns
-        for pattern in DANGEROUS_PATTERNS.iter() {
-            if pattern.regex.is_match(&combined_text) {
-                threats.push(
-                    Threat::new(
-                        format!("PERM-{}", threats.len() + 1),
-                        pattern.severity,
-                        ThreatCategory::PermissionScope,
-                        pattern.title,
-                    )
-                    .with_message(format!(
-                        "Tool '{}' appears to have {}",
-                        tool.name,
-                        pattern.title.to_lowercase()
-                    ))
-                    .with_evidence(tool.name.clone())
-                    .with_remediation(pattern.remediation)
-                    .with_tool(&tool.name),
-                );
-            }
+        // Code execution - must explicitly say it runs commands
+        if CODE_EXEC_PATTERNS.is_match(description) {
+            threats.push(
+                Threat::new(
+                    format!("PERM-EXEC-{}", tool.name),
+                    Severity::Critical,
+                    ThreatCategory::PermissionScope,
+                    "Code execution capability",
+                )
+                .with_message(format!(
+                    "Tool '{}' can execute shell commands or code",
+                    tool.name
+                ))
+                .with_evidence(description.chars().take(200).collect::<String>())
+                .with_remediation(
+                    "Ensure commands are validated against an allowlist. Consider sandboxing.",
+                )
+                .with_tool(&tool.name),
+            );
         }
 
-        // Check for root path access
-        let schema_str = serde_json::to_string(&tool.input_schema).unwrap_or_default();
-        for pattern in &self.root_path_patterns {
-            if pattern.is_match(&schema_str) {
-                threats.push(
-                    Threat::new(
-                        "PERM-ROOT",
-                        Severity::High,
-                        ThreatCategory::PermissionScope,
-                        "Root filesystem access",
-                    )
-                    .with_message(format!(
-                        "Tool '{}' appears to have access to root or system directories",
-                        tool.name
-                    ))
-                    .with_evidence(
-                        pattern
-                            .find(&schema_str)
-                            .map(|m| m.as_str().to_string())
-                            .unwrap_or_default(),
-                    )
-                    .with_remediation(
-                        "Restrict filesystem access to specific directories needed for the task",
-                    )
-                    .with_tool(&tool.name),
-                );
-                break;
-            }
+        // Credential exposure - must say it returns/gets secrets
+        if CREDENTIAL_PATTERNS.is_match(description) {
+            threats.push(
+                Threat::new(
+                    format!("PERM-CRED-{}", tool.name),
+                    Severity::High,
+                    ThreatCategory::PermissionScope,
+                    "Exposes credentials",
+                )
+                .with_message(format!(
+                    "Tool '{}' may expose sensitive credentials",
+                    tool.name
+                ))
+                .with_evidence(description.chars().take(200).collect::<String>())
+                .with_remediation(
+                    "Credentials should not be returned to the AI. Use secure references instead.",
+                )
+                .with_tool(&tool.name),
+            );
+        }
+
+        // Raw SQL execution
+        if RAW_SQL_PATTERNS.is_match(description) {
+            threats.push(
+                Threat::new(
+                    format!("PERM-SQL-{}", tool.name),
+                    Severity::High,
+                    ThreatCategory::PermissionScope,
+                    "Raw SQL execution",
+                )
+                .with_message(format!(
+                    "Tool '{}' can execute arbitrary SQL queries",
+                    tool.name
+                ))
+                .with_evidence(description.chars().take(200).collect::<String>())
+                .with_remediation(
+                    "Use parameterized queries and restrict to read-only operations where possible.",
+                )
+                .with_tool(&tool.name),
+            );
         }
 
         threats
@@ -163,14 +156,13 @@ impl Default for PermissionScopeDetector {
 impl ThreatDetector for PermissionScopeDetector {
     fn detect(
         &self,
-        _server: &ServerConfig,
+        server: &ServerConfig,
         tools: &[ToolInfo],
         _resources: &[ResourceInfo],
     ) -> Vec<Threat> {
-        tools
-            .iter()
-            .flat_map(|tool| self.check_tool(tool))
-            .collect()
+        let mut threats = self.check_server_args(server);
+        threats.extend(tools.iter().flat_map(|tool| self.check_tool(tool)));
+        threats
     }
 }
 
@@ -178,11 +170,11 @@ impl ThreatDetector for PermissionScopeDetector {
 mod tests {
     use super::*;
 
-    fn make_tool(name: &str, description: &str, schema: serde_json::Value) -> ToolInfo {
+    fn make_tool(name: &str, description: &str) -> ToolInfo {
         ToolInfo {
             name: name.to_string(),
             description: Some(description.to_string()),
-            input_schema: schema,
+            input_schema: serde_json::json!({}),
         }
     }
 
@@ -191,13 +183,25 @@ mod tests {
         let detector = PermissionScopeDetector::new();
         let tools = vec![make_tool(
             "run_command",
-            "Execute a shell command",
-            serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+            "Executes a shell command on the system",
         )];
 
         let threats = detector.detect(&ServerConfig::new("test", "cmd"), &tools, &[]);
         assert!(!threats.is_empty());
-        assert!(threats.iter().any(|t| t.title.contains("code execution")));
+        assert!(threats.iter().any(|t| t.title.contains("Code execution")));
+    }
+
+    #[test]
+    fn no_false_positive_for_read_file() {
+        let detector = PermissionScopeDetector::new();
+        let tools = vec![make_tool(
+            "read_file",
+            "Read the contents of a file from the filesystem",
+        )];
+
+        let threats = detector.detect(&ServerConfig::new("test", "cmd"), &tools, &[]);
+        // Should NOT flag read_file as code execution
+        assert!(!threats.iter().any(|t| t.title.contains("Code execution")));
     }
 
     #[test]
@@ -205,8 +209,7 @@ mod tests {
         let detector = PermissionScopeDetector::new();
         let tools = vec![make_tool(
             "get_api_key",
-            "Retrieve the API key from environment",
-            serde_json::json!({}),
+            "Retrieves the API key from the environment and returns it",
         )];
 
         let threats = detector.detect(&ServerConfig::new("test", "cmd"), &tools, &[]);
@@ -214,20 +217,36 @@ mod tests {
     }
 
     #[test]
-    fn detects_root_path() {
+    fn no_false_positive_for_auth_check() {
         let detector = PermissionScopeDetector::new();
         let tools = vec![make_tool(
-            "read_file",
-            "Read a file",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "default": "/"}
-                }
-            }),
+            "check_auth",
+            "Checks if the user is authenticated",
         )];
 
         let threats = detector.detect(&ServerConfig::new("test", "cmd"), &tools, &[]);
+        // Should NOT flag auth checking as credential exposure
+        assert!(!threats.iter().any(|t| t.title.contains("credential")));
+    }
+
+    #[test]
+    fn detects_root_path() {
+        let detector = PermissionScopeDetector::new();
+        let mut server = ServerConfig::new("test", "npx");
+        server.args = vec!["server".to_string(), "/".to_string()];
+
+        let threats = detector.detect(&server, &[], &[]);
         assert!(threats.iter().any(|t| t.id == "PERM-ROOT"));
+    }
+
+    #[test]
+    fn no_false_positive_for_tmp_path() {
+        let detector = PermissionScopeDetector::new();
+        let mut server = ServerConfig::new("test", "npx");
+        server.args = vec!["server".to_string(), "/tmp".to_string()];
+
+        let threats = detector.detect(&server, &[], &[]);
+        // Should NOT flag /tmp as root access
+        assert!(!threats.iter().any(|t| t.id == "PERM-ROOT"));
     }
 }
