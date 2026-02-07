@@ -47,7 +47,7 @@ thiserror = "1"
 similar = "2"
 
 # File watching (for `watch` command)
-notify = "7"
+notify = "8"
 
 # Hashing (for snapshot hashes)
 sha2 = "0.10"
